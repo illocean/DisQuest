@@ -1,5 +1,10 @@
 # DisQuest
 
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![Vesktop](https://img.shields.io/badge/Vesktop-supported-5865F2)](https://github.com/Vencord/vesktop)
+[![Vencord](https://img.shields.io/badge/Vencord-userplugin-5865F2)](https://github.com/Vendicated/Vencord)
+[![Upstream](https://img.shields.io/badge/fork-Seramicx%2Fdiscord--quest--autocompleter-lightgrey)](https://github.com/Seramicx/discord-quest-autocompleter)
+
 A custom [Vencord](https://github.com/Vendicated/Vencord) userplugin that automatically
 completes Discord quests — videos, activities, achievements, and game/stream quests
 where Discord allows — with first-class [Vesktop](https://github.com/Vencord/vesktop) support.
@@ -181,5 +186,7 @@ first if the plugin changed, rebuild, re-create the marker, restart Vesktop.
 ## Credits
 
 - Upstream: [Seramicx/discord-quest-autocompleter](https://github.com/Seramicx/discord-quest-autocompleter)
+  (mirrored as a true fork at [illocean/discord-quest-autocompleter](https://github.com/illocean/discord-quest-autocompleter);
+  this repo holds the rewritten Vencord userplugin)
 - Maintained by [illocean](https://github.com/illocean), with `0.ninetynine` as contributor
 - See [VESKTOP-SETUP.md](./VESKTOP-SETUP.md) for detailed local setup/backup notes.
