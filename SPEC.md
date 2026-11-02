@@ -4,7 +4,6 @@
 **Type:** Vencord userplugin, GPL-3.0-or-later, fork of Seramicx/discord-quest-autocompleter
 **Files:** src/userplugins/disQuest/index.tsx (plugin logic), native.ts (VencordNative helper: discordsaysAuthorize)
 
-placeholder
 ## Purpose
 
 Complete Discord quests automatically (videos, activities, achievements, game/stream spoofs) and expose state via local-only slash commands. Vesktop supported: VesktopNative counts as isApp alongside DiscordNative.
