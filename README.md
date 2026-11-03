@@ -8,27 +8,42 @@ A Vencord user plugin — fork of [Seramicx/discord-quest-autocompleter](https:/
 
 ## Preview
 
-`/disquest status` renders a box-panel summary of quests, session stats, and settings:
-
 ```text
-/disquest status
-+---------------------------------------------+
-| QUESTS                                      |
-| current / enrolled / claimed / queued       |
-+---------------------------------------------+
-| SESSION                                     |
-| Done:      12                               |
-| Enrolled:  14                               |
-| check:     120m                             |
-+---------------------------------------------+
-| SETTINGS                                    |
-| autoAccept: on                              |
-| autoClaim:  off                             |
-| check:      120m                            |
-+---------------------------------------------+
-| ACTIVE                                      |
-| Writing... 0/60s                            |
-+---------------------------------------------+
+┌─ STATUS ───────────────────────────────
+│ State     Running · up 2h 14m
+│ Bridge    missing (desktop quests
+│           skipped)
+└────────────────────────────────────────
+
+┌─ SESSION ──────────────────────────────
+│ Done       12
+│ Enrolled   14
+└────────────────────────────────────────
+
+┌─ QUEUE ────────────────────────────────
+│ Total      3
+│ Parked     1
+│ Cooling    0
+└────────────────────────────────────────
+
+┌─ SETTINGS ─────────────────────────────
+│ autoAccept  on
+│ autoClaim   off
+│ check       120m
+└────────────────────────────────────────
+
+┌─ ACTIVE ───────────────────────────────
+│ ▸ Call of Duty: Modern Warfare 4
+│   1200/1800
+│
+│ 1. 99 Nights in the Forest
+│    not started
+└────────────────────────────────────────
+
+┌─ PARKED ───────────────────────────────
+│ · VALORANT HUSH
+└────────────────────────────────────────
+
 ```
 
 `/disquest start` resumes automation; `/disquest stop` freezes all scans and queue processing until started again.
@@ -43,11 +58,11 @@ A Vencord user plugin — fork of [Seramicx/discord-quest-autocompleter](https:/
 | **Auto-complete** | Runs video, activity, achievement, and game/stream quests to completion |
 | **Auto-claim** | Claims finished rewards via hCaptcha solver (setting `autoClaim`, needs a captcha key) |
 | **Achievement bypass** | Auto-completes achievement quests (setting `achievementBypass`) |
-| **Game spoofing** | Injects a fake process into RunningGameStore for PLAY_ON_DESKTOP quests (desktop only) |
+| **Game spoofing** | Injects a fake process into RunningGameStore for PLAY_ON_DESKTOP quests (desktop only; Discord may still require proof a real game ran — see below) |
 | **Stream spoofing** | Spoofs stream metadata for STREAM_ON_DESKTOP quests (needs 1+ person in a VC) |
 | **Quest queue** | Sequential FIFO with per-quest cooldowns; cooling quests cycle to the back |
 | **Heartbeat watchdog** | Detects a stalled quest (no heartbeat 150s) and rotates it to the back |
-| **Manual heartbeat** | Falls back to a direct `/quests/{id}/heartbeat` when native beats are rejected |
+| **Manual heartbeat** | One direct `/quests/{id}/heartbeat` beat when native beats are rejected; quests Discord refuses are parked with the real reason (never hammered — avoids 429s) |
 | **Vesktop support** | Detects `VesktopNative` as well as `DiscordNative` for game/stream quests |
 | **Box-panel status** | `/disquest status` summarizes everything in one readable box |
 
@@ -112,14 +127,15 @@ Typical first run:
 3. Wait — the plugin scans every 60s and refreshes the quest list every `fetchIntervalMinutes`.
 4. Run `/disquest status` anytime to see what is active, queued, or parked.
 
-> **Desktop app required** for game/stream quests — `PLAY_ON_DESKTOP` and `STREAM_ON_DESKTOP` need Discord's desktop client (Vencord or Vesktop). Video and activity quests work anywhere.
+> **Game quests need a real game.**
+> Discord now validates executable_path + executable_fingerprint on the heartbeat - proof a real game binary ran. Without it the endpoint answers 401 and DisQuest parks the quest telling you exactly that instead of retrying. Video, activity, and achievement quests work anywhere.
 
 ---
 
 ## How it works
 
 - **Video quests** (`WATCH_VIDEO`) post `/quests/{id}/video-progress` in small steps, paced so it never gets more than ~10s ahead of real time.
-- **Game quests** (`PLAY_ON_DESKTOP`) inject a fake running game into `RunningGameStore` and patch the accessor methods; Discord's own heartbeat sender then credits progress.
+- **Game quests** (`PLAY_ON_DESKTOP`) inject a fake running game into `RunningGameStore` and patch the accessor methods; Discord's own heartbeat sender then credits progress. If native beats are rejected, one direct heartbeat is tried - Discord now requires proof a real game executable ran, so without it the quest is parked with that reason.
 - **Stream quests** (`STREAM_ON_DESKTOP`) spoof `ApplicationStreamingStore.getStreamerActiveStreamMetadata`; requires a voice channel with 1+ other person.
 - **Activity quests** (`PLAY_ACTIVITY`) use the internal activity auth flow and send `/quests/{id}/heartbeat` every 20s.
 - **Achievement quests** (`ACHIEVEMENT_IN_ACTIVITY`) run an OAuth flow against the quest's application to forge progress (toggle with `achievementBypass`).
@@ -134,6 +150,8 @@ Typical first run:
 - `startQuest()` drops quests with a missing/NaN `target` instead of looping forever.
 - WATCH_VIDEO progress guards against NaN `secondsDone` / `enrolledAt`.
 - New `pauseBetweenQuestsSeconds` and `retryCooldownMinutes` settings.
+- Manual play takeover sends one heartbeat (no multi-variant probing) - the old burst earned HTTP 429s that starved the whole queue.
+- HTTP 401 heartbeats park the quest with an honest reason: Discord requires proof a real game executable ran, so launch the actual game to finish those.
 
 ---
 

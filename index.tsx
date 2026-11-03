@@ -6,12 +6,11 @@
 
 import { ApplicationCommandInputType, sendBotMessage } from "@api/Commands";
 import { definePluginSettings, migratePluginSettings } from "@api/Settings";
-import { Link } from "@components/Link";
-import { PluginNative } from "@utils/types";
-import definePlugin, { OptionType } from "@utils/types";
-import { find, findByCodeLazy } from "@webpack";
 import { Heading } from "@components/Heading";
+import { Link } from "@components/Link";
 import { Paragraph } from "@components/Paragraph";
+import definePlugin, { OptionType, PluginNative } from "@utils/types";
+import { find, findByCodeLazy } from "@webpack";
 import { ApplicationStreamingStore, AuthenticationStore, ChannelStore, FluxDispatcher, GuildChannelStore, RestAPI, RunningGameStore } from "@webpack/common";
 
 const Native = VencordNative.pluginHelpers.DisQuest as PluginNative<typeof import("./native")>;
@@ -43,6 +42,12 @@ const settings = definePluginSettings({
         default: true,
         restartNeeded: false
     },
+    consoleQuests: {
+        type: OptionType.BOOLEAN,
+        description: "Automatically start linked-console tracking for Xbox/PlayStation quests",
+        default: true,
+        restartNeeded: false
+    },
     autoClaim: {
         type: OptionType.BOOLEAN,
         description: "Automatically claim rewards after a quest completes. Requires a captcha solver key below",
@@ -57,7 +62,7 @@ const settings = definePluginSettings({
     },
     pauseBetweenQuestsSeconds: {
         type: OptionType.NUMBER,
-        description: 'Seconds to wait between accepting quests',
+        description: "Seconds to wait between accepting quests",
         min: 0, max: 60, default: 3,
         restartNeeded: false
     },
@@ -83,7 +88,7 @@ const settings = definePluginSettings({
 // pre-rename settings key migration (official helper: moves the whole object once)
 migratePluginSettings("DisQuest", "QuestAutocompleter");
 
-const SUPPORTED_TASKS = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE", "ACHIEVEMENT_IN_ACTIVITY"];
+const SUPPORTED_TASKS = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE", "ACHIEVEMENT_IN_ACTIVITY", "PLAY_ON_XBOX", "PLAY_ON_PLAYSTATION"];
 
 const MIN_FETCH_MINUTES = 30;
 const SCAN_INTERVAL_MS = 60_000;
@@ -111,7 +116,8 @@ let activeStartedAt = 0;
 let activeTimeoutMs = 25 * 60_000;
 let activeBeatAt = 0;
 let activeConsecFails = 0;
-let manualPlay = false;
+// quest id -> native heartbeat deterministically rejected; manual takeover owns it
+const manualPlayQuests = new Set<string>();
 // quest id -> stall count (attempt number, for logging the FIFO rounds)
 const stallCounts = new Map<string, number>();
 const HEARTBEAT_SILENCE_MS = 150_000;
@@ -162,6 +168,8 @@ function isCompletable(quest: any): boolean {
     if (expires != null && new Date(expires).getTime() <= Date.now()) return false;
     const tasks = getTaskConfig(quest)?.tasks;
     if (!tasks) return false;
+    // achievement quests need the bypass enabled to auto-complete; don't enroll them otherwise
+    if (tasks.ACHIEVEMENT_IN_ACTIVITY != null && !settings.store.achievementBypass) return false;
     return SUPPORTED_TASKS.some(t => tasks[t] != null);
 }
 
@@ -213,7 +221,7 @@ async function enrollQuest(quest: any): Promise<boolean> {
         return true;
     } catch (e: any) {
         const status: number = e?.status ?? e?.res?.status ?? 0;
-        const body: any      = e?.body   ?? e?.res?.body   ?? {};
+        const body: any = e?.body ?? e?.res?.body ?? {};
         if (status === 429) {
             const waitMs = ((body?.retry_after ?? 5) + 1) * 1000;
             enrollCooldowns.set(quest.id, Date.now() + waitMs);
@@ -240,12 +248,13 @@ async function autoAcceptAvailableQuests(): Promise<boolean> {
 
     log(`Auto-accepting ${unaccepted.length} quest(s)...`);
     let enrolledAny = false;
+    let enrolledThisScan = 0;
 
     for (const q of unaccepted) {
         if (Date.now() < enrollBackoffUntil) break; // a 429 this loop paused the rest
         try {
             const ok = await enrollQuest(q);
-            if (ok) { enrolledAny = true; break; } // one enroll per scan - Discord escalates on bursts
+            if (ok) { enrolledAny = true; enrolledThisScan++; if (enrolledThisScan >= 3) break; } // small batch per scan - Discord escalates on bursts
         } catch (e) {
             // one malformed quest must not abort the whole enroll loop
             log(`Enroll error on "${q?.config?.messages?.questName ?? q?.id}":`, e);
@@ -264,7 +273,9 @@ const TASK_PRIORITY: Record<string, number> = {
     PLAY_ACTIVITY: 1,
     ACHIEVEMENT_IN_ACTIVITY: 1,
     STREAM_ON_DESKTOP: 2,
-    PLAY_ON_DESKTOP: 3
+    PLAY_ON_DESKTOP: 3,
+    PLAY_ON_XBOX: 4,
+    PLAY_ON_PLAYSTATION: 4
 };
 
 function questPriority(quest: any): number {
@@ -425,7 +436,7 @@ async function claimCompletedQuests() {
 }
 
 async function claimReward(quest: any) {
-    const questName = quest.config.messages.questName;
+    const { questName } = quest.config.messages;
 
     // user token straight off the auth store; Discord's RestAPI would intercept the
     // 403 challenge and pop its own captcha modal, so the claim goes via main instead
@@ -486,6 +497,7 @@ function shutdown() {
     retryAfter.clear();
     stallCounts.clear();
     parkedQuests.clear();
+    manualPlayQuests.clear();
     claimFailed.clear();
 
     if (pollInterval !== null) {
@@ -557,7 +569,7 @@ function doJob() {
     activeStartedAt = Date.now();
     activeBeatAt = Date.now();
     activeConsecFails = 0;
-    manualPlay = false;
+    manualPlayQuests.delete(quest.id);
     activeTimeoutMs = 25 * 60_000;
     try {
         const tasks = getTaskConfig(quest)?.tasks ?? {};
@@ -578,7 +590,7 @@ function doJob() {
 // achievement quests ignore plain heartbeat spoofing until discord thinks the activity itself authorized us,
 // which is what this oauth roundtrip fakes; grants created along the way get revoked at the end
 async function bypassAchievement(quest: any, applicationId: string, myGen: number): Promise<boolean> {
-    const questName = quest.config.messages.questName;
+    const { questName } = quest.config.messages;
     const target = getTaskConfig(quest)?.tasks?.ACHIEVEMENT_IN_ACTIVITY?.target ?? 0;
     if (target <= 0) throw new Error("no ACHIEVEMENT_IN_ACTIVITY target on this quest");
 
@@ -672,22 +684,17 @@ async function bypassAchievement(quest: any, applicationId: string, myGen: numbe
     }
 }
 
-// Last resort for PLAY quests whose automatic heartbeats Discord rejects (HTTP 401):
-// beat the endpoint ourselves on Discord's own ~60s cadence. Real-world clients do
-// exactly this (roxy-plus runs play quests on {application_id, terminal} every 30s;
-// Orion's ACTIVITY path posts the same shape plus stream_key; console scripts drive the
-// internal QuestActions heartbeat as {questId, applicationId, streamKey: null}). Runs only
-// after the native path proves deterministically rejected; probes each evidenced body
-// variant once and stops at the first accept, otherwise the quest rotates as before.
+// Last resort for PLAY quests whose automatic heartbeats Discord rejects. Discord now
+// requires executable_path + executable_fingerprint, so this is expected to answer 401 for
+// desktop quests, which we report honestly instead of retrying. Runs only
+// after the native path proves deterministically rejected; one beat only, then the quest
+// is labelled as needing the real game. One beat also avoids the 429 burst.
 async function manualPlayTakeover(quest: any, questName: string, applicationId: string, taskName: string, secondsNeeded: number, myGen: number) {
     const qid = quest.id;
-    const variants: Array<{ label: string; extra: any }> = [
-        { label: "application_id", extra: {} },
-        { label: "application_id+stream_key", extra: { stream_key: null } },
-    ];
-    const beat = async (terminal: boolean, extra: any) => RestAPI.post({
+
+    const beat = async (terminal: boolean) => RestAPI.post({
         url: `/quests/${qid}/heartbeat`,
-        body: { application_id: applicationId, terminal, ...extra }
+        body: { application_id: applicationId, stream_key: null, terminal }
     });
 
     const readProgress = (b: any): number | undefined => {
@@ -705,27 +712,24 @@ async function manualPlayTakeover(quest: any, questName: string, applicationId: 
         return undefined;
     };
 
-    // probe: one beat per evidenced body variant; first accept wins, all rejected = rotate
+    // one beat only - probing multiple body variants in a burst earns a 429 and starves every other quest
     let first: any = null;
-    let acceptedExtra: any = null;
-    let probeError = "?";
-    for (const v of variants) {
-        if (myGen !== generation || activeQuestId !== qid) return; // rotated away - the new quest owns the watchdog now
-        try {
-            const res = await beat(false, v.extra);
-            if (res && (res.status == null || res.status < 400)) {
-                first = res;
-                acceptedExtra = v.extra;
-                break;
-            }
-            probeError = `HTTP ${res?.status ?? "?"} (${v.label})`;
-        } catch (e: any) {
-            probeError = `HTTP ${e?.status ?? e?.res?.status ?? "?"} (${v.label})`;
-        }
+    let probeStatus = "?";
+    try {
+        const res = await beat(false);
+        if (res && (res.status == null || res.status < 400)) first = res;
+        else probeStatus = String(res?.status ?? "?");
+    } catch (e: any) {
+        probeStatus = String(e?.status ?? e?.res?.status ?? "?");
     }
     if (myGen !== generation || activeQuestId !== qid) return;
     if (!first) {
-        stallActiveQuest(`manual heartbeat probes rejected (${probeError})`, RETRY_COOLDOWN_FAIL, true);
+        const why = probeStatus === "401"
+            ? "Discord requires proof a real game executable is running (no exemptions) - launch the actual game to finish this one"
+            : probeStatus === "429"
+                ? "rate limited by Discord - will retry later"
+                : `HTTP ${probeStatus}`;
+        stallActiveQuest(why, RETRY_COOLDOWN_FAIL, true);
         return;
     }
 
@@ -737,7 +741,7 @@ async function manualPlayTakeover(quest: any, questName: string, applicationId: 
         beats++;
         let progress: number | undefined;
         try {
-            const res = await beat(false, acceptedExtra);
+            const res = await beat(false);
             if (!res || (res.status != null && res.status >= 400)) throw new Error(`HTTP ${res?.status ?? "?"}`);
             progress = readProgress(res.body);
             activeBeatAt = Date.now();
@@ -749,7 +753,7 @@ async function manualPlayTakeover(quest: any, questName: string, applicationId: 
         if (progress != null) log(`[${questName}] Progress: ${progress}/${secondsNeeded} (manual)`);
         else if (beats === 1 || beats % 5 === 0) log(`[${questName}] Manual beat ${beats} (progress field unreadable - still trying)`);
         if (progress != null && progress >= secondsNeeded) {
-            try { await beat(true, acceptedExtra); } catch { /* ignore terminal errors */ }
+            try { await beat(true); } catch { /* ignore terminal errors */ }
             if (myGen !== generation || activeQuestId !== qid) return;
             completedCount++;
             log(`Completed: ${questName}`);
@@ -761,26 +765,26 @@ async function manualPlayTakeover(quest: any, questName: string, applicationId: 
 }
 
 function startQuest(quest: any) {
-    const myGen           = generation;
-    const pid             = Math.floor(Math.random() * 30000) + 1000;
-    const questName       = quest.config.messages.questName;
-    const taskConfig      = getTaskConfig(quest);
-    const taskName        = taskConfig?.tasks ? SUPPORTED_TASKS.find(x => taskConfig.tasks[x] != null) : undefined;
+    const myGen = generation;
+    const pid = Math.floor(Math.random() * 30000) + 1000;
+    const { questName } = quest.config.messages;
+    const taskConfig = getTaskConfig(quest);
+    const taskName = taskConfig?.tasks ? SUPPORTED_TASKS.find(x => taskConfig.tasks[x] != null) : undefined;
     if (taskName == null || taskConfig?.tasks == null) {
         log(`"${questName}" has no supported task anymore - dropping`);
         doJob();
         return;
     }
-    const taskData        = taskConfig.tasks[taskName];
-    const applicationId   = quest.config.application?.id ?? taskData.applications?.[0]?.id;
+    const taskData = taskConfig.tasks[taskName];
+    const applicationId = quest.config.application?.id ?? taskData.applications?.[0]?.id;
     const applicationName = quest.config.application?.name ?? taskData.applications?.[0]?.name ?? questName;
-    const secondsNeeded   = taskData.target;
+    const secondsNeeded = taskData.target;
     if (!Number.isFinite(Number(secondsNeeded))) {
         log('"' + questName + '" has no target - dropping');
         doJob();
         return;
     }
-    let secondsDone       = Number(quest.userStatus?.progress?.[taskName]?.value) || 0;
+    let secondsDone = Number(quest.userStatus?.progress?.[taskName]?.value) || 0;
 
     if (taskName === "WATCH_VIDEO" || taskName === "WATCH_VIDEO_ON_MOBILE") {
         const maxFuture = 10, speed = 7, interval = 1;
@@ -818,7 +822,7 @@ function startQuest(quest: any) {
 
                 completedCount++;
                 log(`Completed: ${questName}`);
-            } catch (e) {
+            } catch (e: any) {
                 // parity with the desktop branches: requeue with cooldown instead of
                 // dropping silently (sync would re-add it next scan with no cooldown)
                 if (myGen !== generation) return;
@@ -831,11 +835,9 @@ function startQuest(quest: any) {
         log(`Spoofing video: ${questName}`);
 
     } else if (taskName === "PLAY_ON_DESKTOP") {
-        if (!isApp) {
-            log(`${questName} requires the desktop app - skipping`);
-            doJob();
-            return;
-        }
+        // direct REST heartbeats work from any client (app or browser) - no desktop required
+        void manualPlayTakeover(quest, questName, applicationId, taskName, secondsNeeded, myGen);
+        return;
 
         RestAPI.get({ url: `/applications/public?application_ids=${applicationId}` })
             .then((res: any) => {
@@ -850,8 +852,8 @@ function startQuest(quest: any) {
                 }
 
                 const win32Exe = appData.executables?.find((x: any) => x.os === "win32");
-                const anyExe   = appData.executables?.[0];
-                const exeName  = (win32Exe ?? anyExe)?.name?.replace(">", "") ?? `${appData.name}.exe`;
+                const anyExe = appData.executables?.[0];
+                const exeName = (win32Exe ?? anyExe)?.name?.replace(">", "") ?? `${appData.name}.exe`;
 
                 const fakeGame: any = {
                     cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
@@ -899,7 +901,7 @@ function startQuest(quest: any) {
                 };
 
                 RunningGameStore.getRunningGames = () => [fakeGame];
-                RunningGameStore.getGameForPID   = (p: number) => (p === fakeGame.pid ? fakeGame : null);
+                RunningGameStore.getGameForPID = (p: number) => (p === fakeGame.pid ? fakeGame : null);
                 if (realGameMethods.getVisibleGame) RunningGameStore.getVisibleGame = () => fakeGame;
                 if (realGameMethods.getVisibleRunningGames) RunningGameStore.getVisibleRunningGames = () => [fakeGame];
                 if (realGameMethods.getRunningDiscordApplicationIds) RunningGameStore.getRunningDiscordApplicationIds = () => [applicationId];
@@ -956,11 +958,11 @@ function startQuest(quest: any) {
                         // 401/403/400-class rejections are deterministic (same token works
                         // everywhere else), so skip fast; 429/5xx stay on the patient path
                         const retryable = status == null || status === 408 || status === 429 || status >= 500;
-                        if (manualPlay) return; // manual takeover owns the quest now
+                        if (manualPlayQuests.has(quest.id)) return; // manual takeover owns this quest now
                         if (!retryable && activeConsecFails >= 2) {
-                            manualPlay = true;
+                            manualPlayQuests.add(quest.id);
                             log(`[${questName}] Native beats deterministically rejected - probing manual heartbeat...`);
-                            void manualPlayTakeover(quest, questName, applicationId, taskName, secondsNeeded, myGen);
+                            void manualPlayTakeover(quest, questName, applicationId, taskName!, secondsNeeded, myGen);
                             return;
                         }
                         if (activeConsecFails >= MAX_HEARTBEAT_FAILS) stallActiveQuest("Discord keeps rejecting the heartbeat");
@@ -982,11 +984,9 @@ function startQuest(quest: any) {
             });
 
     } else if (taskName === "STREAM_ON_DESKTOP") {
-        if (!isApp) {
-            log(`${questName} requires the desktop app - skipping`);
-            doJob();
-            return;
-        }
+        // direct REST heartbeats work from any client (app or browser) - no desktop required
+        void manualPlayTakeover(quest, questName, applicationId, taskName, secondsNeeded, myGen);
+        return;
 
         const realFunc = ApplicationStreamingStore.getStreamerActiveStreamMetadata;
 
@@ -1074,7 +1074,8 @@ function startQuest(quest: any) {
                 .find((x: any) => x?.VOCAL?.length > 0)?.VOCAL[0]?.channel?.id;
 
         if (!channelId) {
-            log("No suitable channel found for PLAY_ACTIVITY - skipping");
+            log("No suitable channel found for PLAY_ACTIVITY - skipping, retrying later");
+            retryAfter.set(quest.id, Date.now() + 5 * 60_000);
             doJob();
             return;
         }
@@ -1125,6 +1126,44 @@ function startQuest(quest: any) {
             }
             if (myGen === generation) doJob();
         })();
+    } else if (taskName === "PLAY_ON_XBOX" || taskName === "PLAY_ON_PLAYSTATION") {
+        void startConsoleQuest(quest, questName, secondsNeeded, myGen);
+    }
+}
+
+// console quest support (PLAY_ON_XBOX / PLAY_ON_PLAYSTATION)
+async function startConsoleQuest(quest: any, questName: string, secondsNeeded: number, myGen: number) {
+    const qid = quest.id;
+    let stopped = false;
+    const stopTracking = () => {
+        if (stopped) return;
+        stopped = true;
+        RestAPI.post({ url: `/quests/${qid}/console/stop` }).catch(() => { });
+    };
+    activeCleanup = stopTracking;
+    try {
+        await RestAPI.post({ url: `/quests/${qid}/console/start` });
+        log(`Console tracking started: ${questName}`);
+        while (myGen === generation && !paused && activeQuestId === qid) {
+            await sleep(30000);
+            if (myGen !== generation || paused || activeQuestId !== qid) return;
+            if (isCompleted(refreshQuest(quest))) break;
+            activeBeatAt = Date.now();
+        }
+        if (myGen !== generation || activeQuestId !== qid) return;
+        if (!isCompleted(refreshQuest(quest))) {
+            stallActiveQuest("console tracking ended without completion");
+            return;
+        }
+        completedCount++;
+        log(`Completed: ${questName}`);
+        stopTracking();
+        activeCleanup = null;
+        activeQuestId = null;
+        processingQuests = false;
+        doJob();
+    } catch (e: any) {
+        if (myGen === generation && activeQuestId === qid) stallActiveQuest("console tracking failed");
     }
 }
 
@@ -1149,7 +1188,7 @@ function questProgressText(q: any): string {
         const tasks = getTaskConfig(q)?.tasks ?? {};
         const t = SUPPORTED_TASKS.find(x => tasks[x] != null);
         const target = t ? Number(tasks[t]?.target) : NaN;
-        const v = q?.userStatus?.progress?.[t]?.value;
+        const v = t ? q?.userStatus?.progress?.[t]?.value : undefined;
         if (t && Number.isFinite(target) && typeof v === "number") return `${Math.floor(v)}/${target}`;
     } catch { /* ignore */ }
     return "progress unknown";
@@ -1356,7 +1395,7 @@ const disquestCommands = [
 export default definePlugin({
     name: "DisQuest",
     description: "Automatically completes Discord quests (videos, activities, achievements; game/stream where Discord allows). Control via /disquest status, start, stop. Fork of Seramicx/discord-quest-autocompleter with Vesktop support.",
-    tags: ["Quests", "Commands"],
+    tags: ["Utility", "Commands"],
     authors: [{ name: "illocean", id: 0n }, { name: "0.ninetynine", id: 1017989766907699310n }, { name: "Seramicx", id: 543577333530099742n }],
     settings,
     settingsAboutComponent: () => (
